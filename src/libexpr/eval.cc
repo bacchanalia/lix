@@ -94,6 +94,14 @@ static const char * makeImmutableString(std::string_view s)
     return t;
 }
 
+static Value::StringMeta * makeStringMeta(size_t size, const char * * context)
+{
+    auto meta = (Value::StringMeta *) allocBytes(sizeof(Value::StringMeta));
+    meta->size = size;
+    meta->context = context;
+    return meta;
+}
+
 
 RootValue allocRootValue(Value * v)
 {
@@ -157,7 +165,10 @@ std::string showType(const Value & v)
     #pragma GCC diagnostic push
     #pragma GCC diagnostic ignored "-Wswitch-enum"
     switch (v.internalType) {
-        case tString: return v.string.context ? "a string with context" : "a string";
+        case tStringEmpty: return v.stringContext() ? "a string with context" : "a string";
+        case tStringUnknownSize: return "a string";
+        case tStringKnownSize: return "a string";
+        case tStringWithContext: return "a string with context";
         case tPrimOp:
             return fmt("the built-in function '%s'", std::string(v.primOp->name));
         case tPrimOpApp:
@@ -253,7 +264,7 @@ static Symbol getName(const AttrName & name, EvalState & state, Env & env)
         Value nameValue;
         name.expr->eval(state, env, nameValue);
         state.forceStringNoCtx(nameValue, name.expr->getPos(), "while evaluating an attribute name");
-        return state.symbols.create(nameValue.string.s);
+        return state.symbols.create(nameValue.str());
     }
 }
 
@@ -877,34 +888,41 @@ DebugTraceStacker::DebugTraceStacker(EvalState & evalState, DebugTrace t)
         evalState.runDebugRepl(nullptr, trace.env, trace.expr);
 }
 
-void Value::mkString(std::string_view s)
+void Value::mkString(const char * s, size_t size, const char * * context)
 {
-    mkString(makeImmutableString(s));
+
+    if (size == 0) {
+        mkEmptyString(context);
+    } else if (! context) {
+        mkStringKnownSize(s, size);
+    } else {
+        mkStringWithContext(s, makeStringMeta(size, context));
+    }
 }
 
-
-static void copyContextToValue(Value & v, const NixStringContext & context)
+void Value::mkString(std::string_view s)
 {
-    if (!context.empty()) {
-        size_t n = 0;
-        v.string.context = (const char * *)
-            allocBytes((context.size() + 1) * sizeof(char *));
-        for (auto & i : context)
-            v.string.context[n++] = dupString(i.to_string().c_str());
-        v.string.context[n] = 0;
-    }
+    mkString(makeImmutableString(s), s.size());
 }
 
 void Value::mkString(std::string_view s, const NixStringContext & context)
 {
-    mkString(s);
-    copyContextToValue(*this, context);
+    mkStringMove(makeImmutableString(s), s.size(), context);
 }
 
-void Value::mkStringMove(const char * s, const NixStringContext & context)
+void Value::mkStringMove(const char * s, size_t size, const NixStringContext & context)
 {
-    mkString(s);
-    copyContextToValue(*this, context);
+    if (context.empty())
+        mkString(s, size);
+    else {
+        auto vContext = (const char * *) allocBytes((context.size() + 1) * sizeof(char *));
+        mkString(s, size, vContext);
+
+        size_t n = 0;
+        for (auto & i : context)
+            vContext[n++] = dupString(i.to_string().c_str());
+        vContext[n] = 0;
+    }
 }
 
 
@@ -1330,7 +1348,7 @@ void ExprAttrs::eval(EvalState & state, Env & env, Value & v)
         if (nameVal.type() == nNull)
             continue;
         state.forceStringNoCtx(nameVal, i.pos, "while evaluating the name of a dynamic attribute");
-        auto nameSym = state.symbols.create(nameVal.string.s);
+        auto nameSym = state.symbols.create(nameVal.str());
         Bindings::iterator j = v.attrs->find(nameSym);
         if (j != v.attrs->end())
             state.error<EvalError>("dynamic attribute '%1%' already defined at %2%", state.symbols[nameSym], state.positions[j->pos]).atPos(i.pos).withFrame(env, *this).debugThrow();
@@ -2091,8 +2109,9 @@ void ExprConcatStrings::eval(EvalState & state, Env & env, Value & v)
         if (!context.empty())
             state.error<EvalError>("a string that refers to a store path cannot be appended to a path").atPos(pos).withFrame(env, *this).debugThrow();
         v.mkPath(CanonPath(canonPath(str())));
-    } else
-        v.mkStringMove(c_str(), context);
+    } else {
+        v.mkStringMove(c_str(), sSize, context);
+    }
 }
 
 
@@ -2256,7 +2275,7 @@ std::string_view EvalState::forceString(Value & v, const PosIdx pos, std::string
                 showType(v),
                 ValuePrinter(*this, v, errorPrintOptions)
             ).atPos(pos).debugThrow();
-        return v.string.s;
+        return v.str();
     } catch (Error & e) {
         e.addTrace(positions[pos], errorCtx);
         throw;
@@ -2266,8 +2285,8 @@ std::string_view EvalState::forceString(Value & v, const PosIdx pos, std::string
 
 void copyContext(const Value & v, NixStringContext & context)
 {
-    if (v.string.context)
-        for (const char * * p = v.string.context; *p; ++p)
+    if (v.stringContext())
+        for (const char * * p = v.stringContext(); *p; ++p)
             context.insert(NixStringContextElem::parse(*p));
 }
 
@@ -2283,8 +2302,8 @@ std::string_view EvalState::forceString(Value & v, NixStringContext & context, c
 std::string_view EvalState::forceStringNoCtx(Value & v, const PosIdx pos, std::string_view errorCtx)
 {
     auto s = forceString(v, pos, errorCtx);
-    if (v.string.context) {
-        error<EvalError>("the string '%1%' is not allowed to refer to a store path (such as '%2%')", v.string.s, v.string.context[0]).withTrace(pos, errorCtx).debugThrow();
+    if (v.stringContext()) {
+        error<EvalError>("the string '%1%' is not allowed to refer to a store path (such as '%2%')", v.c_str(), v.stringContext()[0]).withTrace(pos, errorCtx).debugThrow();
     }
     return s;
 }
@@ -2297,7 +2316,7 @@ bool EvalState::isDerivation(Value & v)
     if (i == v.attrs->end()) return false;
     forceValue(*i->value, i->pos);
     if (i->value->type() != nString) return false;
-    return strcmp(i->value->string.s, "derivation") == 0;
+    return strcmp(i->value->c_str(), "derivation") == 0;
 }
 
 
@@ -2329,7 +2348,7 @@ BackedStringView EvalState::coerceToString(
 
     if (v.type() == nString) {
         copyContext(v, context);
-        return std::string_view(v.string.s);
+        return v.str();
     }
 
     if (v.type() == nPath) {
@@ -2534,7 +2553,7 @@ bool EvalState::eqValues(Value & v1, Value & v2, const PosIdx pos, std::string_v
             return v1.boolean == v2.boolean;
 
         case nString:
-            return strcmp(v1.string.s, v2.string.s) == 0;
+            return strcmp(v1.c_str(), v2.c_str()) == 0;
 
         case nPath:
             return strcmp(v1._path, v2._path) == 0;

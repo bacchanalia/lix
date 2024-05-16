@@ -141,7 +141,11 @@ struct NixRepl
      * Note: This is `shared_ptr` to avoid garbage collection.
      */
     std::shared_ptr<Value *> replOverlaysEvalFunction =
+    #if HAVE_BOEHMGC
         std::allocate_shared<Value *>(traceable_allocator<Value *>(), nullptr);
+    #else
+        std::make_shared<Value *>(nullptr);
+    #endif
 
     /**
      * Get the `info` AttrSet that's passed as the first argument to each
@@ -670,7 +674,7 @@ ProcessLineResult NixRepl::processLine(std::string line)
         Value v;
         evalString(arg, v);
         if (v.type() == nString) {
-            std::cout << v.string.s;
+            std::cout << v.c_str();
         } else {
             printValue(std::cout, v);
         }
