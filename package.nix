@@ -190,8 +190,6 @@ stdenv.mkDerivation (finalAttrs: {
           configureFiles
           topLevelBuildFiles
           functionalTestFiles
-        ]
-        ++ lib.optionals (!finalAttrs.dontBuild || internalApiDocs || lintInsteadOfBuild) [
           ./doc
           ./lix
           ./misc
